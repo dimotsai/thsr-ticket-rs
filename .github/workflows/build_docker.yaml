@@ -1,6 +1,9 @@
 name: Build Docker Image
 
 on:
+  push:
+    branches:
+      - dev
   workflow_dispatch:
     inputs:
       os:
@@ -15,7 +18,7 @@ on:
 
 jobs:
   build:
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.os || 'ubuntu-latest' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
