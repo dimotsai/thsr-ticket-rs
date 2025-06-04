@@ -1,0 +1,35 @@
+name: Build Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Select OS to build'
+        required: true
+        default: 'ubuntu-latest'
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t thsr-ticket-rs:latest .
+
+      - name: Save Docker image to file
+        run: |
+          docker save thsr-ticket-rs:latest -o thsr-ticket-rs-image.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thsr-ticket-rs-image
+          path: thsr-ticket-rs-image.tar
