@@ -189,7 +189,7 @@ pub mod booking_flow {
         payload.select_class_type(&args.class_type, args.interactive);
         
         // Input security code
-        payload.input_security_code(img_resp.bytes().unwrap(), args.interactive);
+        payload.input_security_code(img_resp.bytes().unwrap(), args.interactive, &args.solver);
 
         // Make the booking request
         let resp = client
@@ -407,8 +407,48 @@ pub mod booking_flow {
             }
         }
 
-        pub fn input_security_code(&mut self, img_data: Bytes, interactive: bool) {
+        pub fn input_security_code(&mut self, img_data: Bytes, interactive: bool, solver: &Option<String>) {
             show_image(&img_data, interactive);
+
+            let mut effective_solver = solver.clone();
+
+            // Auto-detect solver plugin in common paths
+            if effective_solver.is_none() {
+                let candidates = ["thsr_solver.py", "deprecated_python/thsr_solver.py"];
+                for cand in candidates {
+                    let plugin_path = std::path::Path::new(cand);
+                    if plugin_path.exists() {
+                        let python_exe = if cfg!(target_os = "windows") {
+                            if std::path::Path::new(".venv/Scripts/python.exe").exists() { ".venv/Scripts/python.exe".to_string() } else { "python".to_string() }
+                        } else { "python3".to_string() };
+                        effective_solver = Some(format!("{} {}", python_exe, cand));
+                        println!("Auto-detected solver plugin: {}", effective_solver.as_ref().unwrap());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(cmd_str) = effective_solver {
+                println!("Calling external solver: {} ...", cmd_str);
+                let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+                if !parts.is_empty() {
+                    let mut cmd = Command::new(parts[0]);
+                    if parts.len() > 1 { cmd.args(&parts[1..]); }
+                    cmd.arg("tmp_code.jpg");
+
+                    match cmd.output() {
+                        Ok(output) => {
+                            let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if !code.is_empty() {
+                                println!("Solver output: {}", code);
+                                self.security_code = code;
+                                return;
+                            }
+                        }
+                        Err(e) => println!("Error running solver: {}", e),
+                    }
+                }
+            }
 
             println!("Input security code:");
             let mut input = String::new();

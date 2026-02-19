@@ -64,4 +64,8 @@ pub struct Args {
     /// Run in interactive mode (prompts for missing inputs)
     #[arg(long, short = 'i')]
     pub interactive: bool,
+
+    /// External OCR solver command (e.g., "python ocr_helper.py"). If not specified, the program will auto-detect "thsr_solver.py" in the current directory    
+    #[arg(long, value_name = "COMMAND")]
+    pub solver: Option<String>,
 }
