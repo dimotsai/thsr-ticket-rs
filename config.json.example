@@ -1,0 +1,9 @@
+{
+  "personal_id": "A123456789",
+  "from": "台北",
+  "to": "左營",
+  "adult_cnt": 1,
+  "seat_prefer": 1,
+  "use_membership": true,
+  "headless": true
+}

@@ -1,96 +1,27 @@
-# THSR-Ticket Rust
+# THSR Ticket Booking Tool (Nana Edition)
 
-A program for booking ticket of Taiwan High Speed Railway (THSR).
+A high-performance CLI tool for booking Taiwan High Speed Rail (THSR) tickets, integrated with OCR and MCP.
 
-This is the rust version of the original python ver [THSR-Ticket](https://github.com/BreezeWhite/THSR-Ticket), with improvements including more CLI input options, early-bird support, membership, etc.
+## 🚀 Standard Operating Procedures (SOP)
 
-## Install
-### Download from the [Release](https://github.com/BreezeWhite/thsr-ticket-rs/releases) page
+- **10s Timeout**: All THSR executions MUST have a strict 10-second timeout to prevent resource hogging on Windows.
+- **Full Automation**: No manual captcha input. The tool relies entirely on `ddddocr` for automatic solving.
+- **Minimalist CLI**: Legacy parameters have been removed to keep the interface clean and professional.
 
-Pick the one according to your OS, download the executable file, and open the terminal to execute it.
+## 🛠️ Features & Integration
 
-You could also put it to one of your PATH dir (e.g. ~/.local/bin for Ubuntu) to always make it accessable.
+- **Native Monitoring**: `thsr.exe` now supports native monitoring and retries via the `--monitor` and `--retries` flags.
+- **thsr_mcp.py**: MCP Bridge for AI Agents (like Luna) to book tickets natively via Gemini CLI.
+- **thsr_solver.py**: Optimized Python-based OCR plugin for automatic captcha solving.
+- **thsr.exe**: Core Rust-based booking engine.
 
-### Install with cargo
+## 🧹 Legacy Cleanup (Feb 18, 2026)
 
-Make sure you have [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed.
+The following parameters and features have been removed/deprecated as per Nana's instructions:
+- `Enter captcha code manually`: Removed to ensure full automation.
+- `--model <FILE>` (Rust built-in model): Removed.
+- `--wait-for-captcha`: Removed.
+- `--monitor` (in MCP mode): Simplified to single-run with timeout.
 
-For older linux machines, this method is preferred, since the release is built by Github Action and the workflow only supports Ubuntu-22.04 and latter.
-
-```bash
-# Install rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build and install
-cargo install --git https://github.com/BreezeWhite/thsr-ticket-rs
-```
-
-## Usage
-
-```bash
-# Use without flags.
-# This will guide you through the process for entering informations.
-thsr
-
-# Or pass values to arguments.
-# If some required informations are not specified, the program will ask you to enter.
-thsr --from 2 --to 11 --adult-cnt 2
-
-# To see available stations and its ID value
-thsr --list-station
-
-# To see available times and its ID value
-thsr --list-time-table
-
-# All following date formats are supported
-thsr --date 2025/01/01
-thsr --date 2025/1/01
-thsr --date 2025/01/1
-thsr --date 2025/1/1
-
-# Use membership. The membership ID will be the same as the personal ID.
-thsr --use-membership true
-```
-
-### Complete options
-
-```bash
-A CLI tool for booking Taiwan High Speed Rail tickets. Run the program without flags will guide you through the booking process
-
-Usage: thsr [OPTIONS]
-
-Options:
-  -i, --personal-id <ID>
-          Personal ID
-  -d, --date <DATE>
-          Departure date
-  -T, --time <TIME_ID>
-          Time ID of the departure time. To see available times, use the --list-time-table option
-  -f, --from <STATION_ID>
-          Departure station ID. To see available stations, use the --list-station option
-  -t, --to <STATION_ID>
-          Arrival station ID. To see available stations, use the --list-station option
-  -a, --adult-cnt <NUMBER>
-          Number of adults
-  -s, --student-cnt <NUMBER>
-          Number of students
-  -p, --seat-prefer <NUMBER>
-          Seat preference. 0: None, 1: Window, 2: Aisle [possible values: 0, 1, 2]
-  -c, --class-type <NUMBER>
-          Class type. 0: Standard, 1: Business [possible values: 0, 1]
-  -m, --use-membership <TO_USE_MEMBERSHIP>
-          Whether to use personal ID as membership [possible values: true, false]
-      --list-station
-          List available stations
-      --list-time-table
-          List available times
-  -h, --help
-          Print help
-  -V, --version
-          Print version
-```
-
-
-## ***DISCLAIMER***
-
-This is an unofficial implementation and is for research purpose only. Any legal liability is on your own. Use at your own risk.
+---
+*Maintained by Nana & Luna*
