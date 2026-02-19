@@ -14,7 +14,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use crate::cli::Args;
-use crate::schema::{STATION_MAP, TIME_TABLE, TicketType};
+use crate::schema::{STATION_MAP, STATION_MAP_ZH, TIME_TABLE, TicketType, resolve_station, resolve_time};
 
 static BASE_URL: &str = "https://irs.thsrc.com.tw";
 static BOOKING_PAGE_URL: &str = "https://irs.thsrc.com.tw/IMINT/?locale=tw";
@@ -55,7 +55,10 @@ fn get_header() -> HeaderMap {
     headers
 }
 
-fn get_input<T: FromStr>(hint: &str, default: T) -> T {
+fn get_input<T: FromStr>(hint: &str, default: T, interactive: bool) -> T {
+    if !interactive {
+        return default;
+    }
     println!("{hint}");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).unwrap_or_default();
@@ -66,31 +69,51 @@ fn get_input<T: FromStr>(hint: &str, default: T) -> T {
     input.parse().unwrap_or(default)
 }
 
-pub fn run(args: Args) {
+pub fn run(args: Args) -> bool {
     let policy = reqwest::redirect::Policy::limited(20);
     let client = Client::builder()
         .redirect(policy)
         .default_headers(get_header())
         .cookie_store(true)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
+
+    // First page validation
+    if !args.interactive {
+        if args.from.is_none() {
+            println!("Error: Departure station (--from) is required in non-interactive mode.");
+            return false;
+        }
+        if args.to.is_none() {
+            println!("Error: Destination station (--to) is required in non-interactive mode.");
+            return false;
+        }
+        if args.date.is_none() {
+            println!("Error: Date (--date) is required in non-interactive mode.");
+            return false;
+        }
+        if args.time.is_none() {
+            println!("Error: Time (--time) is required in non-interactive mode.");
+            return false;
+        }
+    }
 
     // First page
     let resp = match booking_flow::run_flow(&client, &args) {
         Ok(resp) => resp,
         Err(err_msg) => {
             println!("Error: {}", err_msg);
-            return;
+            return false;
         }
     };
 
     // Second Page
-    let resp = match confirm_train_flow::run_flow(resp, &client) {
+    let resp = match confirm_train_flow::run_flow(resp, &client, &args) {
         Ok(resp) => resp,
         Err(err_msg) => {
             println!("Error: {}", err_msg);
-            return;
+            return false;
         }
     };
 
@@ -99,12 +122,13 @@ pub fn run(args: Args) {
         Ok(resp) => resp,
         Err(err_msg) => {
             println!("Error: {}", err_msg);
-            return;
+            return false;
         }
     };
 
     // Show the final booking result
     show_result(&resp);
+    true
 }
 
 pub fn parse_error(page: &Html) -> Option<String> {
@@ -133,10 +157,10 @@ pub mod booking_flow {
             .cookies()
             .find(|cookie| cookie.name() == "JSESSIONID")
             .map(|cookie| cookie.value().to_string())
-            .unwrap();
+            .ok_or_else(|| "Failed to get JSESSIONID from initial response".to_string())?;
 
         // Parse to HTML object
-        let body = response.text().unwrap(); // Get the response body as a string
+        let body = response.text().unwrap();
         let document = Html::parse_document(&body);
 
         // Request security code image
@@ -147,23 +171,25 @@ pub mod booking_flow {
         let mut payload = BookingPayload::default();
         payload.search_by = parse_search_by(&document);
         payload.types_of_trip = parse_types_of_trip_value(&document);
-        payload.select_start_station(&args.from);
-        payload.select_dest_station(&args.to);
+        payload.select_start_station(&args.from, args.interactive);
+        payload.select_dest_station(&args.to, args.interactive);
         let (start_date, end_date) = parse_avail_start_end_date(&document);
-        payload.select_date(&start_date, &end_date, &args.date);
-        payload.select_time(&args.time);
+        payload.select_date(&start_date, &end_date, &args.date, args.interactive);
+        payload.select_time(&args.time, args.interactive);
         if args.adult_cnt.is_none() && args.student_cnt.is_none() {
-            payload.select_ticket_num(TicketType::Adult, &None);
+            payload.select_ticket_num(TicketType::Adult, &None, args.interactive);
         }
         if args.adult_cnt.is_some() {
-            payload.select_ticket_num(TicketType::Adult, &args.adult_cnt);
+            payload.select_ticket_num(TicketType::Adult, &args.adult_cnt, args.interactive);
         }
         if args.student_cnt.is_some() {
-            payload.select_ticket_num(TicketType::College, &args.student_cnt);
+            payload.select_ticket_num(TicketType::College, &args.student_cnt, args.interactive);
         }
-        payload.select_seat_prefer(&args.seat_prefer);
-        payload.select_class_type(&args.class_type);
-        payload.input_security_code(img_resp.bytes().unwrap());
+        payload.select_seat_prefer(&args.seat_prefer, args.interactive);
+        payload.select_class_type(&args.class_type, args.interactive);
+        
+        // Input security code
+        payload.input_security_code(img_resp.bytes().unwrap(), args.interactive);
 
         // Make the booking request
         let resp = client
@@ -173,7 +199,6 @@ pub mod booking_flow {
             .send()
             .unwrap();
 
-        // Parse to HTML object
         let resp_html = Html::parse_document(&resp.text().unwrap());
         if let Some(err_msg) = parse_error(&resp_html) {
             return Err(err_msg);
@@ -214,7 +239,7 @@ pub mod booking_flow {
         format!("{}{}", BASE_URL, img_url)
     }
 
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct BookingPayload {
         #[serde(rename(serialize = "selectStartStation"))]
         pub start_station: u8,
@@ -336,16 +361,21 @@ pub mod booking_flow {
     }
 
     impl BookingPayload {
-        pub fn select_start_station(&mut self, from: &Option<usize>) {
-            if let Some(from) = from {
-                self.start_station = from.clone() as u8;
-                return;
+        pub fn select_start_station(&mut self, from: &Option<String>, interactive: bool) {
+            if let Some(from_str) = from {
+                if let Some(idx) = resolve_station(from_str) {
+                    self.start_station = idx as u8;
+                    return;
+                }
+                println!("Warning: Station '{}' not found.", from_str);
             }
 
-            for (i, station) in STATION_MAP.iter().enumerate() {
-                println!("{}: {:?}", i + 1, station);
+            if interactive {
+                for (i, (&en, &zh)) in STATION_MAP.iter().zip(STATION_MAP_ZH.iter()).enumerate() {
+                    println!("{}: {} ({})", i + 1, zh, en);
+                }
             }
-            let input = get_input("Please select start station (default: 1):", 1);
+            let input = get_input("Please select start station (default: 1):", 1, interactive);
             if input > 0 && input <= STATION_MAP.len() {
                 self.start_station = input as u8;
             } else {
@@ -354,16 +384,21 @@ pub mod booking_flow {
             }
         }
 
-        pub fn select_dest_station(&mut self, to: &Option<usize>) {
-            if let Some(to) = to {
-                self.dest_station = to.clone() as u8;
-                return;
+        pub fn select_dest_station(&mut self, to: &Option<String>, interactive: bool) {
+            if let Some(to_str) = to {
+                if let Some(idx) = resolve_station(to_str) {
+                    self.dest_station = idx as u8;
+                    return;
+                }
+                println!("Warning: Station '{}' not found.", to_str);
             }
 
-            for (i, station) in STATION_MAP.iter().enumerate() {
-                println!("{}: {:?}", i + 1, station);
+            if interactive {
+                for (i, (&en, &zh)) in STATION_MAP.iter().zip(STATION_MAP_ZH.iter()).enumerate() {
+                    println!("{}: {} ({})", i + 1, zh, en);
+                }
             }
-            let input = get_input("Please select destination station (default: 12):", 12);
+            let input = get_input("Please select destination station (default: 12):", 12, interactive);
             if input > 0 && input <= STATION_MAP.len() {
                 self.dest_station = input as u8;
             } else {
@@ -372,14 +407,12 @@ pub mod booking_flow {
             }
         }
 
-        pub fn input_security_code(&mut self, img_data: Bytes) {
+        pub fn input_security_code(&mut self, img_data: Bytes, interactive: bool) {
+            show_image(&img_data, interactive);
+
             println!("Input security code:");
-            show_image(&img_data);
-            // Read the security code from the user
             let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .expect("Failed to read input");
+            std::io::stdin().read_line(&mut input).expect("Failed to read input");
             self.security_code = input.trim().to_string();
         }
 
@@ -388,6 +421,7 @@ pub mod booking_flow {
             start_date: &String,
             end_date: &String,
             date: &Option<String>,
+            interactive: bool
         ) {
             let input = match date.clone() {
                 Some(date) => date,
@@ -397,6 +431,7 @@ pub mod booking_flow {
                         start_date, end_date, start_date
                     ),
                     start_date.clone(),
+                    interactive
                 ),
             };
 
@@ -421,10 +456,16 @@ pub mod booking_flow {
             }
         }
 
-        pub fn select_time(&mut self, time: &Option<usize>) {
-            let opt = match time.clone() {
-                Some(time) => time,
-                None => {
+        pub fn select_time(&mut self, time: &Option<String>, interactive: bool) {
+            let opt = if let Some(time_str) = time {
+                if let Some(idx) = resolve_time(time_str) {
+                    idx
+                } else {
+                    println!("Warning: Time ID/format '{}' not found, falling back to manual selection.", time_str);
+                    10
+                }
+            } else {
+                if interactive {
                     for (idx, &t_str) in TIME_TABLE.iter().enumerate() {
                         let mut t_int = t_str[..t_str.len() - 1].parse::<u16>().unwrap();
                         if t_str.ends_with('A') && (t_int / 100) == 12 {
@@ -440,8 +481,8 @@ pub mod booking_flow {
                             &formatted_time[formatted_time.len() - 2..]
                         );
                     }
-                    get_input("Select departure time (default: 10):", 10)
                 }
+                get_input("Select departure time (default: 10):", 10, interactive)
             };
 
             if opt > TIME_TABLE.len() {
@@ -453,7 +494,7 @@ pub mod booking_flow {
             self.outbound_time = TIME_TABLE[opt - 1].to_string();
         }
 
-        pub fn select_ticket_num(&mut self, ticket_type: TicketType, val: &Option<u8>) {
+        pub fn select_ticket_num(&mut self, ticket_type: TicketType, val: &Option<u8>, interactive: bool) {
             let mut val = match val.clone() {
                 Some(val) => val,
                 None => get_input(
@@ -462,6 +503,7 @@ pub mod booking_flow {
                         ticket_type
                     ),
                     1,
+                    interactive
                 ),
             };
 
@@ -480,12 +522,13 @@ pub mod booking_flow {
             }
         }
 
-        pub fn select_seat_prefer(&mut self, prefer: &Option<usize>) {
+        pub fn select_seat_prefer(&mut self, prefer: &Option<usize>, interactive: bool) {
             let input = match prefer.clone() {
                 Some(prefer) => prefer,
                 None => get_input(
                     "Please select seat preference (0: any, 1: window, 2: aisle) (default: 0):",
                     0,
+                    interactive
                 ),
             };
 
@@ -497,12 +540,13 @@ pub mod booking_flow {
             }
         }
 
-        pub fn select_class_type(&mut self, class_type: &Option<usize>) {
+        pub fn select_class_type(&mut self, class_type: &Option<usize>, interactive: bool) {
             let input = match class_type.clone() {
                 Some(class_type) => class_type,
                 None => get_input(
                     "Please select class type (0: standard, 1: business) (default: 0):",
                     0,
+                    interactive
                 ),
             };
 
@@ -532,27 +576,30 @@ pub mod booking_flow {
         }
     }
 
-    fn show_image(img_data: &[u8]) {
-        // Save the image to a file
+    fn show_image(img_data: &[u8], interactive: bool) {
         let file_name = "tmp_code.jpg";
         fs::write(file_name, img_data).expect("Failed to write image file");
+
+        if !interactive {
+            return;
+        }
 
         // Open the image using the default image viewer
         if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .args(&["/C", file_name])
                 .spawn()
-                .expect("Failed to open image");
+                .ok();
         } else if cfg!(target_os = "macos") {
             Command::new("open")
                 .arg(file_name)
                 .spawn()
-                .expect("Failed to open image");
+                .ok();
         } else if cfg!(target_os = "linux") {
             Command::new("xdg-open")
                 .arg(file_name)
                 .spawn()
-                .expect("Failed to open image");
+                .ok();
         } else {
             println!("Please open the image manually: {}", file_name);
         }
@@ -563,7 +610,7 @@ pub mod booking_flow {
 pub mod confirm_train_flow {
     use super::*;
 
-    pub fn run_flow(document: Html, client: &Client) -> Result<Html, String> {
+    pub fn run_flow(document: Html, client: &Client, args: &Args) -> Result<Html, String> {
         // Parse alerts
         let alerts = parse_alert_body(&document);
         println!("{}", alerts.join("\n"));
@@ -571,7 +618,7 @@ pub mod confirm_train_flow {
         // Parse available trains
         let trains = parse_trains(&document);
         let mut payload = ConfirmTrainPayload::default();
-        payload.select_available_trains(trains.as_slice());
+        payload.select_available_trains(trains.as_slice(), args)?;
 
         let resp = client
             .post(CONFIRM_TRAIN_URL)
@@ -597,7 +644,7 @@ pub mod confirm_train_flow {
     }
 
     fn parse_trains(document: &Html) -> Vec<Train> {
-        let selector = Selector::parse("label.result-item").unwrap(); // Adjust the selector based on `self.cond.from_html`
+        let selector = Selector::parse("label.result-item").unwrap();
         let avail = document.select(&selector);
 
         avail
@@ -677,21 +724,38 @@ pub mod confirm_train_flow {
     }
 
     impl ConfirmTrainPayload {
-        pub fn select_available_trains(&mut self, trains: &[Train]) {
-            for (idx, train) in trains.iter().enumerate() {
-                println!(
-                    "{:>2}. {:>4} {:>3}~{} {:>3} {}",
-                    idx + 1,
-                    train.id,
-                    train.depart,
-                    train.arrive,
-                    train.travel_time,
-                    train.discount_info
-                );
+        pub fn select_available_trains(&mut self, trains: &[Train], args: &Args) -> Result<(), String> {
+            if args.interactive {
+                for (idx, train) in trains.iter().enumerate() {
+                    println!(
+                        "{:>2}. {:>4} {:>3}~{} {:>3} {}",
+                        idx + 1,
+                        train.id,
+                        train.depart,
+                        train.arrive,
+                        train.travel_time,
+                        train.discount_info
+                    );
+                }
             }
 
-            let selection = get_input("Select a train (default: 1):", 1);
-            self.selected_train = trains[selection - 1].form_value.clone();
+            // Select by train number
+            if let Some(train_no) = args.train_no {
+                for train in trains {
+                    if train.id == train_no {
+                        self.selected_train = train.form_value.clone();
+                        return Ok(());
+                    }
+                }
+            }
+
+            let selection = get_input("Select a train (default: 1):", 1, args.interactive);
+            if selection > 0 && selection <= trains.len() {
+                self.selected_train = trains[selection - 1].form_value.clone();
+            } else {
+                self.selected_train = trains[0].form_value.clone();
+            }
+            Ok(())
         }
     }
 }
@@ -701,35 +765,32 @@ pub mod confirm_ticket_flow {
     use super::*;
 
     pub fn run_flow(document: &Html, client: &Client, args: &Args) -> Result<Html, String> {
-        // let body = fs::read_to_string("confirm_response.html").unwrap();
-        // let body = std::fs::read_to_string("confirm_ticket_super_early_bird.html").unwrap();
-
         let mut payload = ConfirmTicketPayload::default();
 
         // Input personal ID
-        let personal_id = payload.input_personal_id(&args.personal_id);
+        let personal_id = payload.input_personal_id(&args.personal_id, args.interactive);
 
         // Parse membership radio
         let (radio_value, add_payload) =
-            process_membership(&document, &personal_id, &args.use_membership);
+            process_membership(&document, &personal_id, &args.use_membership, args.interactive);
         payload.member_radio = radio_value;
 
         // Additional flow for early bird
-        let mut payload = serde_urlencoded::to_string(&payload).unwrap();
-        if let Some(additional_payload) = process_early_bird(&document, &personal_id) {
+        let mut body = serde_urlencoded::to_string(&payload).unwrap();
+        if let Some(additional_payload) = process_early_bird(&document, &personal_id, args.interactive) {
             let additional_payload = serde_urlencoded::to_string(&additional_payload).unwrap();
-            payload = format!("{}&{}", payload, additional_payload);
+            body = format!("{}&{}", body, additional_payload);
         }
 
         if let Some(add_payload) = add_payload {
-            payload = format!("{}&{}", payload, add_payload);
+            body = format!("{}&{}", body, add_payload);
         }
 
         println!("Booking...");
         let resp = client
             .post(CONFIRM_TICKET_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(payload)
+            .body(body)
             .send()
             .unwrap();
 
@@ -751,7 +812,7 @@ pub mod confirm_ticket_flow {
         #[serde(rename(
             serialize = "TicketMemberSystemInputPanel:TakerMemberSystemDataView:memberSystemRadioGroup"
         ))]
-        pub member_radio: String, // 非高鐵會員, 企業會員 / 高鐵會員 / 企業會員統編
+        pub member_radio: String, // 非高鐵會員, 企業會員 / 高鐵會員 / 企業會員 統編
 
         #[serde(rename(serialize = "BookingS3FormSP:hf:0"), default)]
         form_mark: String,
@@ -805,15 +866,17 @@ pub mod confirm_ticket_flow {
     }
 
     impl ConfirmTicketPayload {
-        pub fn input_personal_id(&mut self, personal_id: &Option<String>) -> String {
+        pub fn input_personal_id(&mut self, personal_id: &Option<String>, interactive: bool) -> String {
             let input = match personal_id.clone() {
                 Some(id) => id,
                 None => {
+                    if !interactive {
+                        panic!("Personal ID is required in non-interactive mode.");
+                    }
                     println!("Input personal ID:");
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input).unwrap_or_default();
-                    let input: String = input.trim().to_string();
-                    input
+                    input.trim().to_string()
                 }
             };
 
@@ -826,11 +889,12 @@ pub mod confirm_ticket_flow {
         page: &Html,
         membership_id: &String,
         to_use_membership: &Option<bool>,
+        interactive: bool
     ) -> (String, Option<String>) {
         let use_membership = match to_use_membership {
             Some(v) => *v,
             None => {
-                match get_input("Use membership (y/n, default: n):", "n".to_string()).as_str() {
+                match get_input("Use membership (y/n, default: n):", "n".to_string(), interactive).as_str() {
                     "y" => true,
                     _ => false,
                 }
@@ -864,7 +928,7 @@ pub mod confirm_ticket_flow {
         (membership_radio.to_string(), None)
     }
 
-    fn process_early_bird(page: &Html, personal_id: &str) -> Option<HashMap<String, String>> {
+    fn process_early_bird(page: &Html, personal_id: &str, interactive: bool) -> Option<HashMap<String, String>> {
         let selector = Selector::parse(".superEarlyBird").unwrap();
         let elem: Vec<String> = page
             .select(&selector)
@@ -878,32 +942,33 @@ pub mod confirm_ticket_flow {
         let personal_id = get_input(
             &format!("Passenger's ID number (default: {}):", personal_id),
             personal_id.to_string(),
+            interactive
         );
 
         let early_type_selector = Selector::parse(
-            "input[name='TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataTypeName']").unwrap();
+            "input[name='TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataTypeName']").unwrap();
         let early_type_elem = page.select(&early_type_selector).next().unwrap();
         let early_type = early_type_elem.attr("value").unwrap().to_string();
 
         let mut additional_payload = HashMap::from([
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataLastName".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataLastName".to_string(),
                 "".to_string(),
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataFirstName".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataFirstName".to_string(),
                 "".to_string(),
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataTypeName".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataTypeName".to_string(),
                 early_type.clone(),
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataIdNumber".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataIdNumber".to_string(),
                 personal_id,
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataInputChoice".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataInputChoice".to_string(),
                 "0".to_string(), // 0 for ID, 1 for passport
             ),
         ]);
@@ -916,8 +981,9 @@ pub mod confirm_ticket_flow {
                         i + 1
                     ),
                     "".to_string(),
+                    interactive
                 );
-                if inp_id.is_empty() {
+                if inp_id.is_empty() && interactive {
                     println!("ID should not be empty!");
                 } else {
                     break inp_id;
@@ -925,23 +991,23 @@ pub mod confirm_ticket_flow {
             };
 
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataLastName"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataLastName"),
                 "".to_string(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataFirstName"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataFirstName"),
                 "".to_string(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataTypeName"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataTypeName"),
                 early_type.clone(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataIdNumber"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataIdNumber"),
                 inp_id.trim().to_string(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataInputChoice"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataInputChoice"),
                 "0".to_string(), // 0 for ID, 1 for passport
             );
         }
