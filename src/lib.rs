@@ -81,20 +81,20 @@ pub fn run(args: Args) -> bool {
 
     // First page validation
     if !args.interactive {
-        if args.from.is_none() {
+        if args.from.is_none() { 
             println!("Error: Departure station (--from) is required in non-interactive mode.");
             return false;
         }
-        if args.to.is_none() {
+        if args.to.is_none() { 
             println!("Error: Destination station (--to) is required in non-interactive mode.");
             return false;
         }
-        if args.date.is_none() {
+        if args.date.is_none() { 
             println!("Error: Date (--date) is required in non-interactive mode.");
             return false;
         }
-        if args.time.is_none() {
-            println!("Error: Time (--time) is required in non-interactive mode.");
+        if args.time.is_none() && args.range_start.is_none() { 
+            println!("Error: Either Time (--time) or Range Start (--range-start) is required in non-interactive mode.");
             return false;
         }
     }
@@ -161,49 +161,115 @@ pub mod booking_flow {
 
         // Parse to HTML object
         let body = response.text().unwrap();
-        let document = Html::parse_document(&body);
+        let mut document = Html::parse_document(&body);
 
-        // Request security code image
-        let sec_code_img_url = parse_security_code_img_url(&document);
-        let img_resp = client.get(&sec_code_img_url).send().unwrap();
-
-        // Making selections
-        let mut payload = BookingPayload::default();
-        payload.search_by = parse_search_by(&document);
-        payload.types_of_trip = parse_types_of_trip_value(&document);
-        payload.select_start_station(&args.from, args.interactive);
-        payload.select_dest_station(&args.to, args.interactive);
+        // Initial Payload setup (fields that don't change during refresh)
+        let mut base_payload = BookingPayload::default();
+        base_payload.search_by = parse_search_by(&document);
+        base_payload.types_of_trip = parse_types_of_trip_value(&document);
+        base_payload.select_start_station(&args.from, args.interactive);
+        base_payload.select_dest_station(&args.to, args.interactive);
         let (start_date, end_date) = parse_avail_start_end_date(&document);
-        payload.select_date(&start_date, &end_date, &args.date, args.interactive);
-        payload.select_time(&args.time, args.interactive);
+        base_payload.select_date(&start_date, &end_date, &args.date, args.interactive);
+        base_payload.select_time(&args.time, &args.range_start, args.interactive);
         if args.adult_cnt.is_none() && args.student_cnt.is_none() {
-            payload.select_ticket_num(TicketType::Adult, &None, args.interactive);
+            base_payload.select_ticket_num(TicketType::Adult, &None, args.interactive);
         }
         if args.adult_cnt.is_some() {
-            payload.select_ticket_num(TicketType::Adult, &args.adult_cnt, args.interactive);
+            base_payload.select_ticket_num(TicketType::Adult, &args.adult_cnt, args.interactive);
         }
         if args.student_cnt.is_some() {
-            payload.select_ticket_num(TicketType::College, &args.student_cnt, args.interactive);
+            base_payload.select_ticket_num(TicketType::College, &args.student_cnt, args.interactive);
         }
-        payload.select_seat_prefer(&args.seat_prefer, args.interactive);
-        payload.select_class_type(&args.class_type, args.interactive);
-        
-        // Input security code
-        payload.input_security_code(img_resp.bytes().unwrap(), args.interactive, &args.solver);
+        base_payload.select_seat_prefer(&args.seat_prefer, args.interactive);
+        base_payload.select_class_type(&args.class_type, args.interactive);
 
-        // Make the booking request
-        let resp = client
-            .post(SUBMIT_FORM_URL.replace("{}", &jid))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(serde_urlencoded::to_string(&payload).unwrap())
-            .send()
-            .unwrap();
+        let mut retry_count = 0;
+        let max_retries = 10;
+        loop {
+            // Request security code image
+            let sec_code_img_url = match parse_security_code_img_url(&document) {
+                Some(url) => url,
+                None => {
+                    println!("Error: Could not find captcha image URL. Retrying page load...");
+                    let response = client.get(BOOKING_PAGE_URL).send().unwrap();
+                    document = Html::parse_document(&response.text().unwrap());
+                    continue;
+                }
+            };
+            
+            println!("Fetching captcha from: {}", sec_code_img_url);
+            let img_resp = client.get(&sec_code_img_url).send().unwrap();
+            let img_bytes = img_resp.bytes().unwrap();
+            println!("Captcha image size: {} bytes", img_bytes.len());
 
-        let resp_html = Html::parse_document(&resp.text().unwrap());
-        if let Some(err_msg) = parse_error(&resp_html) {
-            return Err(err_msg);
+            // Update only the security code for the payload
+            let mut payload = base_payload.clone();
+            payload.input_security_code(img_bytes, args.interactive, &args.solver);
+
+            // Make the booking request
+            let submit_url = SUBMIT_FORM_URL.replace("{}", &jid);
+            let resp = client
+                .post(&submit_url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(serde_urlencoded::to_string(&payload).unwrap())
+                .send()
+                .unwrap();
+
+            // Parse to HTML object
+            let resp_text = resp.text().unwrap();
+            let resp_html = Html::parse_document(&resp_text);
+            if let Some(err_msg) = parse_error(&resp_html) {
+                if err_msg.contains("檢核碼錯誤") || err_msg.contains("Validation code error") || err_msg.contains("檢測碼輸入錯誤") {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        return Err(format!("Maximum captcha retries ({}) reached. Giving up.", max_retries));
+                    }
+                    
+                    println!("Captcha error detected. Fetching a fresh one... (Attempt {}/{})", retry_count, max_retries);
+                    
+                    // 1. Find the refresh link (reCodeLink)
+                    let refresh_selector = Selector::parse("#BookingS1Form_homeCaptcha_reCodeLink").unwrap();
+                    if let Some(refresh_link) = resp_html.select(&refresh_selector).next() {
+                        let mut refresh_url_path = None;
+                        
+                        if let Some(href) = refresh_link.attr("href") {
+                            refresh_url_path = Some(href.to_string());
+                        } 
+                        else if let Some(onclick) = refresh_link.attr("onclick") {
+                            if let Some(start) = onclick.find("wicketAjaxGet('") {
+                                let sub = &onclick[start + 15..];
+                                if let Some(end) = sub.find('\'') {
+                                    refresh_url_path = Some(sub[..end].to_string());
+                                }
+                            }
+                        }
+
+                        if let Some(path) = refresh_url_path {
+                            let refresh_url = if path.starts_with("http") {
+                                path
+                            } else {
+                                format!("{}{}", BASE_URL, path)
+                            };
+                            
+                            println!("Refreshing captcha via: {}", refresh_url);
+                            let refresh_resp = client.get(&refresh_url).send().unwrap();
+                            let refreshed_html = Html::parse_document(&refresh_resp.text().unwrap());
+                            document = refreshed_html;
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    }
+                    
+                    println!("Warning: Could not find refresh link. Retrying with current page in 5s...");
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    document = resp_html;
+                    continue;
+                }
+                return Err(err_msg);
+            }
+            return Ok(resp_html);
         }
-        Ok(resp_html)
     }
 
     fn parse_avail_start_end_date(page: &Html) -> (String, String) {
@@ -232,11 +298,25 @@ pub mod booking_flow {
         tag.value().attr("value").unwrap().to_string()
     }
 
-    fn parse_security_code_img_url(page: &Html) -> String {
+    fn parse_security_code_img_url(page: &Html) -> Option<String> {
         let selector = Selector::parse("#BookingS1Form_homeCaptcha_passCode").unwrap();
-        let elem = page.select(&selector).next().unwrap();
-        let img_url = elem.attr("src").unwrap();
-        format!("{}{}", BASE_URL, img_url)
+        if let Some(elem) = page.select(&selector).next() {
+            if let Some(img_url) = elem.attr("src") {
+                return Some(format!("{}{}", BASE_URL, img_url));
+            }
+        }
+        
+        let html_str = page.html();
+        if let Some(start) = html_str.find("src=\"") {
+            let sub = &html_str[start + 5..];
+            if let Some(end) = sub.find('\"') {
+                let path = &sub[..end];
+                if path.contains("passCode") {
+                    return Some(format!("{}{}", BASE_URL, path.replace("&amp;", "&")));
+                }
+            }
+        }
+        None
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -407,61 +487,80 @@ pub mod booking_flow {
             }
         }
 
-        pub fn input_security_code(&mut self, img_data: Bytes, interactive: bool, solver: &Option<String>) {
-            show_image(&img_data, interactive);
-
-            let mut effective_solver = solver.clone();
-
-            // Auto-detect solver plugin in common paths
-            if effective_solver.is_none() {
-                let candidates = ["thsr_solver.py", "deprecated_python/thsr_solver.py"];
-                for cand in candidates {
-                    let plugin_path = std::path::Path::new(cand);
-                    if plugin_path.exists() {
-                        let python_exe = if cfg!(target_os = "windows") {
-                            if std::path::Path::new(".venv/Scripts/python.exe").exists() { ".venv/Scripts/python.exe".to_string() } else { "python".to_string() }
-                        } else { "python3".to_string() };
-                        effective_solver = Some(format!("{} {}", python_exe, cand));
-                        println!("Auto-detected solver plugin: {}", effective_solver.as_ref().unwrap());
-                        break;
-                    }
-                }
-            }
-
-            if let Some(cmd_str) = effective_solver {
-                println!("Calling external solver: {} ...", cmd_str);
-                let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-                if !parts.is_empty() {
-                    let mut cmd = Command::new(parts[0]);
-                    if parts.len() > 1 { cmd.args(&parts[1..]); }
-                    cmd.arg("tmp_code.jpg");
-
-                    match cmd.output() {
-                        Ok(output) => {
-                            let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                            if !code.is_empty() {
-                                println!("Solver output: {}", code);
-                                self.security_code = code;
-                                return;
+                                pub fn input_security_code(&mut self, img_data: Bytes, interactive: bool, solver: &Option<String>) {
+                                    show_image(&img_data, interactive);
+                                    // 1. External solver plugin (Python)
+                    let mut effective_solver = solver.clone();
+        
+                    // Auto-detect solver plugin if not specified
+                    if effective_solver.is_none() {
+                        let candidates = [
+                            "thsr_solver.py",
+                            "deprecated_python/thsr_solver.py"
+                        ];
+        
+                        for cand in candidates {
+                            let plugin_path = std::path::Path::new(cand);
+                            if plugin_path.exists() {
+                                let python_exe = if cfg!(target_os = "windows") {
+                                    let venv_py = std::path::Path::new(".venv/Scripts/python.exe");
+                                    if venv_py.exists() {
+                                        venv_py.to_str().unwrap().to_string()
+                                    } else {
+                                        "python".to_string()
+                                    }
+                                } else {
+                                    "python3".to_string()
+                                };
+                                effective_solver = Some(format!("{} {}", python_exe, cand));
+                                println!("Auto-detected solver plugin: {}", effective_solver.as_ref().unwrap());
+                                break;
                             }
                         }
-                        Err(e) => println!("Error running solver: {}", e),
                     }
+        
+                    if let Some(cmd_str) = effective_solver {
+                        println!("Calling external solver: {} ...", cmd_str);
+                        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+                        if parts.is_empty() {
+                            println!("Error: Empty solver command.");
+                        } else {
+                            let mut cmd = Command::new(parts[0]);
+                            if parts.len() > 1 {
+                                cmd.args(&parts[1..]);
+                            }
+                            cmd.arg("tmp_code.jpg");
+        
+                            match cmd.output() {
+                                Ok(output) => {
+                                    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                                    if !code.is_empty() {
+                                        println!("Solver output: {}", code);
+                                        self.security_code = code;
+                                        return;
+                                    } else {
+                                        println!("Warning: Solver returned empty output.");
+                                    }
+                                }
+                                Err(e) => println!("Error running solver: {}", e),
+                            }
+                        }
+                    }
+        
+                    println!("Input security code:");
+                    // Read the security code from the user
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_line(&mut input)
+                        .expect("Failed to read input");
+                    self.security_code = input.trim().to_string();
                 }
-            }
-
-            println!("Input security code:");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).expect("Failed to read input");
-            self.security_code = input.trim().to_string();
-        }
-
-        pub fn select_date(
+                pub fn select_date(
             &mut self,
             start_date: &String,
             end_date: &String,
             date: &Option<String>,
-            interactive: bool
+            interactive: bool,
         ) {
             let input = match date.clone() {
                 Some(date) => date,
@@ -471,7 +570,7 @@ pub mod booking_flow {
                         start_date, end_date, start_date
                     ),
                     start_date.clone(),
-                    interactive
+                    interactive,
                 ),
             };
 
@@ -496,12 +595,18 @@ pub mod booking_flow {
             }
         }
 
-        pub fn select_time(&mut self, time: &Option<String>, interactive: bool) {
+        pub fn select_time(&mut self, time: &Option<String>, range_start: &Option<String>, interactive: bool) {
             let opt = if let Some(time_str) = time {
                 if let Some(idx) = resolve_time(time_str) {
                     idx
                 } else {
                     println!("Warning: Time ID/format '{}' not found, falling back to manual selection.", time_str);
+                    10
+                }
+            } else if let Some(start_str) = range_start {
+                if let Some(idx) = resolve_time(start_str) {
+                    idx
+                } else {
                     10
                 }
             } else {
@@ -543,7 +648,7 @@ pub mod booking_flow {
                         ticket_type
                     ),
                     1,
-                    interactive
+                    interactive,
                 ),
             };
 
@@ -568,7 +673,7 @@ pub mod booking_flow {
                 None => get_input(
                     "Please select seat preference (0: any, 1: window, 2: aisle) (default: 0):",
                     0,
-                    interactive
+                    interactive,
                 ),
             };
 
@@ -586,7 +691,7 @@ pub mod booking_flow {
                 None => get_input(
                     "Please select class type (0: standard, 1: business) (default: 0):",
                     0,
-                    interactive
+                    interactive,
                 ),
             };
 
@@ -617,6 +722,7 @@ pub mod booking_flow {
     }
 
     fn show_image(img_data: &[u8], interactive: bool) {
+        // Save the image to a file
         let file_name = "tmp_code.jpg";
         fs::write(file_name, img_data).expect("Failed to write image file");
 
@@ -629,17 +735,17 @@ pub mod booking_flow {
             Command::new("cmd")
                 .args(&["/C", file_name])
                 .spawn()
-                .ok();
+                .expect("Failed to open image");
         } else if cfg!(target_os = "macos") {
             Command::new("open")
                 .arg(file_name)
                 .spawn()
-                .ok();
+                .expect("Failed to open image");
         } else if cfg!(target_os = "linux") {
             Command::new("xdg-open")
                 .arg(file_name)
                 .spawn()
-                .ok();
+                .expect("Failed to open image");
         } else {
             println!("Please open the image manually: {}", file_name);
         }
@@ -658,7 +764,9 @@ pub mod confirm_train_flow {
         // Parse available trains
         let trains = parse_trains(&document);
         let mut payload = ConfirmTrainPayload::default();
-        payload.select_available_trains(trains.as_slice(), args)?;
+        if let Err(e) = payload.select_available_trains(trains.as_slice(), args) {
+             return Err(e);
+        }
 
         let resp = client
             .post(CONFIRM_TRAIN_URL)
@@ -684,7 +792,7 @@ pub mod confirm_train_flow {
     }
 
     fn parse_trains(document: &Html) -> Vec<Train> {
-        let selector = Selector::parse("label.result-item").unwrap();
+        let selector = Selector::parse("label.result-item").unwrap(); // Adjust the selector based on `self.cond.from_html`
         let avail = document.select(&selector);
 
         avail
@@ -779,22 +887,37 @@ pub mod confirm_train_flow {
                 }
             }
 
-            // Select by train number
             if let Some(train_no) = args.train_no {
                 for train in trains {
                     if train.id == train_no {
+                        println!("Selecting train {} departing at {}", train.id, train.depart);
                         self.selected_train = train.form_value.clone();
                         return Ok(());
                     }
                 }
+                println!("Specified train {} not found in results.", train_no);
+            }
+
+            if let (Some(start), Some(end)) = (&args.range_start, &args.range_end) {
+                 for train in trains {
+                     if train.depart >= *start && train.depart <= *end {
+                         println!("Auto-selecting train {} departing at {}", train.id, train.depart);
+                         self.selected_train = train.form_value.clone();
+                         return Ok(());
+                     }
+                 }
+                 return Err(format!("No trains found in range {} - {}", start, end));
+            }
+
+            if trains.is_empty() {
+                return Err("No trains available for the selected criteria.".to_string());
             }
 
             let selection = get_input("Select a train (default: 1):", 1, args.interactive);
-            if selection > 0 && selection <= trains.len() {
-                self.selected_train = trains[selection - 1].form_value.clone();
-            } else {
-                self.selected_train = trains[0].form_value.clone();
+            if selection == 0 || selection > trains.len() {
+                return Err(format!("Invalid train selection: {}. Available trains: 1-{}", selection, trains.len()));
             }
+            self.selected_train = trains[selection - 1].form_value.clone();
             Ok(())
         }
     }
@@ -816,21 +939,21 @@ pub mod confirm_ticket_flow {
         payload.member_radio = radio_value;
 
         // Additional flow for early bird
-        let mut body = serde_urlencoded::to_string(&payload).unwrap();
+        let mut payload = serde_urlencoded::to_string(&payload).unwrap();
         if let Some(additional_payload) = process_early_bird(&document, &personal_id, args.interactive) {
             let additional_payload = serde_urlencoded::to_string(&additional_payload).unwrap();
-            body = format!("{}&{}", body, additional_payload);
+            payload = format!("{}&{}", payload, additional_payload);
         }
 
         if let Some(add_payload) = add_payload {
-            body = format!("{}&{}", body, add_payload);
+            payload = format!("{}&{}", payload, add_payload);
         }
 
         println!("Booking...");
         let resp = client
             .post(CONFIRM_TICKET_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
+            .body(payload)
             .send()
             .unwrap();
 
@@ -852,13 +975,13 @@ pub mod confirm_ticket_flow {
         #[serde(rename(
             serialize = "TicketMemberSystemInputPanel:TakerMemberSystemDataView:memberSystemRadioGroup"
         ))]
-        pub member_radio: String, // 非高鐵會員, 企業會員 / 高鐵會員 / 企業會員 統編
+        pub member_radio: String, // Member system radio selection (TGO, Corporate, etc.)
 
         #[serde(rename(serialize = "BookingS3FormSP:hf:0"), default)]
         form_mark: String,
 
         #[serde(rename(serialize = "idInputRadio"), default)]
-        id_input_radio: u8, // 0: 身份證字號 / 1: 護照號碼
+        id_input_radio: u8, // 0: Personal ID / 1: Passport
 
         #[serde(rename(serialize = "diffOver"), default = "default_diff_over")]
         diff_over: u8,
@@ -911,12 +1034,13 @@ pub mod confirm_ticket_flow {
                 Some(id) => id,
                 None => {
                     if !interactive {
-                        panic!("Personal ID is required in non-interactive mode.");
+                        panic!("Personal ID is required in non-interactive mode");
                     }
                     println!("Input personal ID:");
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input).unwrap_or_default();
-                    input.trim().to_string()
+                    let input: String = input.trim().to_string();
+                    input
                 }
             };
 
@@ -929,7 +1053,7 @@ pub mod confirm_ticket_flow {
         page: &Html,
         membership_id: &String,
         to_use_membership: &Option<bool>,
-        interactive: bool
+        interactive: bool,
     ) -> (String, Option<String>) {
         let use_membership = match to_use_membership {
             Some(v) => *v,
@@ -982,33 +1106,33 @@ pub mod confirm_ticket_flow {
         let personal_id = get_input(
             &format!("Passenger's ID number (default: {}):", personal_id),
             personal_id.to_string(),
-            interactive
+            interactive,
         );
 
         let early_type_selector = Selector::parse(
-            "input[name='TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataTypeName']").unwrap();
+            "input[name='TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataTypeName']").unwrap();
         let early_type_elem = page.select(&early_type_selector).next().unwrap();
         let early_type = early_type_elem.attr("value").unwrap().to_string();
 
         let mut additional_payload = HashMap::from([
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataLastName".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataLastName".to_string(),
                 "".to_string(),
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataFirstName".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataFirstName".to_string(),
                 "".to_string(),
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataTypeName".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataTypeName".to_string(),
                 early_type.clone(),
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataIdNumber".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataIdNumber".to_string(),
                 personal_id,
             ),
             (
-                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataInputChoice".to_string(),
+                "TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataInputChoice".to_string(),
                 "0".to_string(), // 0 for ID, 1 for passport
             ),
         ]);
@@ -1021,9 +1145,12 @@ pub mod confirm_ticket_flow {
                         i + 1
                     ),
                     "".to_string(),
-                    interactive
+                    interactive,
                 );
-                if inp_id.is_empty() && interactive {
+                if inp_id.is_empty() {
+                    if !interactive {
+                        panic!("Passenger ID should not be empty in non-interactive mode");
+                    }
                     println!("ID should not be empty!");
                 } else {
                     break inp_id;
@@ -1031,23 +1158,23 @@ pub mod confirm_ticket_flow {
             };
 
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataLastName"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataLastName"),
                 "".to_string(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataFirstName"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataFirstName"),
                 "".to_string(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataTypeName"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataTypeName"),
                 early_type.clone(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataIdNumber"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataIdNumber"),
                 inp_id.trim().to_string(),
             );
             additional_payload.insert(
-                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataInputChoice"),
+                format!("TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2:passengerDataInputChoice"),
                 "0".to_string(), // 0 for ID, 1 for passport
             );
         }
@@ -1063,7 +1190,6 @@ fn show_result(page: &Html) {
     println!("\nPlease use the following PNR code for payment and picking up the ticket:");
     println!("PNR Code: {}", pnr_code);
 
-    // Price
     let price_selector = Selector::parse("#setTrainTotalPriceValue").unwrap();
     let price_tag = page.select(&price_selector).next().unwrap();
     let price = price_tag.text().next().unwrap();
@@ -1074,13 +1200,11 @@ fn show_result(page: &Html) {
     println!("Price: {}. Please pay before {}", price, payment_exp_date);
     println!("-------(Ticket Information)-------");
 
-    // Departure date
     let depart_date_selector = Selector::parse("span.date span").unwrap();
     let depart_date_tag = page.select(&depart_date_selector).next().unwrap();
     let depart_date = depart_date_tag.text().next().unwrap();
     println!("{:>7}{}", "Date: ", depart_date);
 
-    // Departure and arrival time
     let depart_time_selector = Selector::parse("#setTrainDeparture0").unwrap();
     let depart_time_tag = page.select(&depart_time_selector).next().unwrap();
     let depart_time = depart_time_tag.text().next().unwrap();
@@ -1095,7 +1219,6 @@ fn show_result(page: &Html) {
         format!("{}~{}", depart_time, arrive_time)
     );
 
-    // Station
     let depart_from_selector = Selector::parse("p.departure-stn span").unwrap();
     let depart_from_tag = page.select(&depart_from_selector).next().unwrap();
     let depart_from = depart_from_tag.text().next().unwrap();
@@ -1106,7 +1229,6 @@ fn show_result(page: &Html) {
     let arrive_to = arrive_to_tag.text().next().unwrap();
     println!("{:>7}{}", "To: ", arrive_to);
 
-    // Seat info
     let seats_selector = Selector::parse("div.seat-label span").unwrap();
     let seats: Vec<String> = page
         .select(&seats_selector)
@@ -1122,4 +1244,20 @@ fn show_result(page: &Html) {
     let seat_type = seat_type_tag.text().next().unwrap();
     println!("Class: {}{}", seat_type, passenger_count);
     println!("Seats: {}", seats.join(", "));
+
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let filename = format!("booking_{}.txt", ts);
+    let mut file_content = format!("--- THSR Booking Success ({}) ---\n", ts);
+    file_content.push_str(&format!("PNR Code: {}\n", pnr_code));
+    file_content.push_str(&format!("Price: {}. Please pay before {}\n", price, payment_exp_date));
+    file_content.push_str(&format!("Date: {}\n", depart_date));
+    file_content.push_str(&format!("Time: {}~{}\n", depart_time, arrive_time));
+    file_content.push_str(&format!("From: {}\n", depart_from));
+    file_content.push_str(&format!("To: {}\n", arrive_to));
+    file_content.push_str(&format!("Class: {}{}\n", seat_type, passenger_count));
+    file_content.push_str(&format!("Seats: {}\n", seats.join(", ")));
+
+    if let Ok(_) = fs::write(&filename, file_content) {
+        println!("\n[System] Booking details saved to {}", filename);
+    }
 }

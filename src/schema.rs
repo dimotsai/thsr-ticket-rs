@@ -1,3 +1,5 @@
+use chrono::NaiveTime;
+
 pub static STATION_MAP: [&str; 12] = [
     "Nangang", "Taipei", "Banqiao", "Taoyuan", "Hsinchu", "Miaoli", "Taichung", "Changhua",
     "Yunlin", "Chiayi", "Tainan", "Zuouing",
@@ -38,34 +40,41 @@ pub fn resolve_time(input: &str) -> Option<usize> {
         }
     }
 
-    let clean_input = input.replace(':', "");
-    if let Ok(target_time) = clean_input.parse::<u16>() {
-        let mut best_idx = None;
-        let mut min_diff = u16::MAX;
+    let target_time = NaiveTime::parse_from_str(input, "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(input, "%H%M"))
+        .ok()?;
 
-        for (i, &t_str) in TIME_TABLE.iter().enumerate() {
-            let mut t_int = t_str[..t_str.len() - 1].parse::<u16>().unwrap();
-            if t_str.ends_with('A') && (t_int / 100) == 12 {
-                t_int %= 1200;
-            } else if t_int != 1230 && t_str.ends_with('P') {
-                t_int += 1200;
-            }
-            
-            let diff = if t_int >= target_time {
-                t_int - target_time
-            } else {
-                (t_int + 2400) - target_time
-            };
+    let mut best_idx = None;
+    let mut min_diff = i64::MAX;
 
+    for (i, &t_str) in TIME_TABLE.iter().enumerate() {
+        let suffix = &t_str[t_str.len() - 1..];
+        let mut time_part = t_str[..t_str.len() - 1].to_string();
+        if time_part.len() < 4 {
+            time_part = format!("{:0>4}", time_part);
+        }
+
+        let mut hour: u32 = time_part[..2].parse().unwrap();
+        let min: u32 = time_part[2..].parse().unwrap();
+
+        if suffix == "A" && hour == 12 {
+            hour = 0;
+        } else if suffix == "P" && hour != 12 {
+            hour += 12;
+        } else if suffix == "N" {
+            hour = 12;
+        }
+
+        if let Some(t) = NaiveTime::from_hms_opt(hour, min, 0) {
+            let diff = (t - target_time).num_minutes().abs();
             if diff < min_diff {
                 min_diff = diff;
                 best_idx = Some(i + 1);
             }
         }
-        return best_idx;
     }
-    
-    None
+
+    best_idx
 }
 
 #[repr(u8)]

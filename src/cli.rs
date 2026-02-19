@@ -57,6 +57,18 @@ pub struct Args {
     #[arg(long, short = 'L')]
     pub list_time_table: bool,
 
+    /// Earliest acceptable departure time (HH:MM)
+    #[arg(long, short = 'S', value_name = "TIME")]
+    pub range_start: Option<String>,
+
+    /// Latest acceptable departure time (HH:MM)
+    #[arg(long, short = 'E', value_name = "TIME")]
+    pub range_end: Option<String>,
+
+    /// Max retries in monitor mode (0 for infinite)
+    #[arg(long, short = 'r', value_name = "NUMBER", default_value_t = 0)]
+    pub retries: u32,
+
     /// Train number (e.g., 603, 1205)
     #[arg(long, short = 'N', value_name = "NUMBER")]
     pub train_no: Option<u32>,
@@ -68,4 +80,16 @@ pub struct Args {
     /// External OCR solver command (e.g., "python ocr_helper.py"). If not specified, the program will auto-detect "thsr_solver.py" in the current directory    
     #[arg(long, value_name = "COMMAND")]
     pub solver: Option<String>,
+
+    /// Periodically check for tickets if not found
+    #[arg(long, short = 'M')]
+    pub monitor: bool,
+
+    /// Interval in seconds between checks in monitor mode (default: 60)
+    #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+    pub interval: u64,
+
+    /// Global timeout in seconds (default: 0, no timeout). Recommended by Nana: 10s for single runs
+    #[arg(long, value_name = "TIMEOUT", default_value_t = 0)]
+    pub timeout: u64,
 }

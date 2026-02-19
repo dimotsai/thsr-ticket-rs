@@ -47,6 +47,16 @@ fn merge_config_into_args(args: &mut Args) {
                     args.personal_id = Some(id.to_string());
                 }
             }
+            if args.from.is_none() {
+                if let Some(from) = json["from"].as_str() {
+                    args.from = Some(from.to_string());
+                }
+            }
+            if args.to.is_none() {
+                if let Some(to) = json["to"].as_str() {
+                    args.to = Some(to.to_string());
+                }
+            }
             if args.adult_cnt.is_none() {
                 if let Some(cnt) = json["adult_cnt"].as_u64() {
                     args.adult_cnt = Some(cnt as u8);
@@ -72,6 +82,11 @@ fn merge_config_into_args(args: &mut Args) {
                     args.use_membership = Some(m);
                 }
             }
+            if args.solver.is_none() {
+                if let Some(s) = json["solver"].as_str() {
+                    args.solver = Some(s.to_string());
+                }
+            }
         }
     } else if args.config.is_some() {
         println!("Warning: Config file {} not found.", config_path);
@@ -92,5 +107,28 @@ fn main() {
     }
 
     merge_config_into_args(&mut args);
-    run(args);
+    
+    if args.monitor {
+        let mut retry_count = 0;
+        let interval = std::time::Duration::from_secs(args.interval);
+        loop {
+            retry_count += 1;
+            println!("\n[{}] Starting check (Attempt {})...", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), retry_count);
+            
+            if run(args.clone()) {
+                println!("\nSUCCESS! Ticket booked.");
+                break;
+            }
+
+            if args.retries > 0 && retry_count >= args.retries {
+                println!("\nMax retries ({}) reached. Exiting.", args.retries);
+                std::process::exit(1);
+            }
+
+            println!("No ticket booked. Waiting {}s...", args.interval);
+            std::thread::sleep(interval);
+        }
+    } else {
+        run(args);
+    }
 }
