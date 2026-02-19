@@ -60,36 +60,78 @@ A CLI tool for booking Taiwan High Speed Rail tickets. Run the program without f
 Usage: thsr [OPTIONS]
 
 Options:
-  -i, --personal-id <ID>
-          Personal ID
+  -C, --config <FILE>
+          Path to config file (JSON)
+  -P, --personal-id <ID>
+          Personal ID (National ID or Passport)
   -d, --date <DATE>
-          Departure date
-  -T, --time <TIME_ID>
-          Time ID of the departure time. To see available times, use the --list-time-table option
-  -f, --from <STATION_ID>
-          Departure station ID. To see available stations, use the --list-station option
-  -t, --to <STATION_ID>
-          Arrival station ID. To see available stations, use the --list-station option
+          Departure date (YYYY/MM/DD)
+  -T, --time <TIME>
+          Time ID or format (HH:MM) of the departure time
+  -f, --from <STATION>
+          Departure station ID or Name (e.g., 2, "Taipei", "台北")
+  -t, --to <STATION>
+          Arrival station ID or Name (e.g., 11, "Tainan", "台南")
   -a, --adult-cnt <NUMBER>
-          Number of adults
+          Number of adults (0-10)
   -s, --student-cnt <NUMBER>
-          Number of students
+          Number of students/college (0-10)
   -p, --seat-prefer <NUMBER>
           Seat preference. 0: None, 1: Window, 2: Aisle [possible values: 0, 1, 2]
   -c, --class-type <NUMBER>
           Class type. 0: Standard, 1: Business [possible values: 0, 1]
   -m, --use-membership <TO_USE_MEMBERSHIP>
-          Whether to use personal ID as membership [possible values: true, false]
-      --list-station
+          Whether to use personal ID as TGO membership [possible values: true, false]
+  -l, --list-station
           List available stations
-      --list-time-table
+  -L, --list-time-table
           List available times
+  -S, --range-start <TIME>
+          Earliest acceptable departure time (HH:MM)
+  -E, --range-end <TIME>
+          Latest acceptable departure time (HH:MM)
+  -r, --retries <NUMBER>
+          Max retries in monitor mode (0 for infinite) [default: 0]
+  -N, --train-no <NUMBER>
+          Train number (e.g., 603, 1205)
+  -i, --interactive
+          Run in interactive mode (prompts for missing inputs)
+      --solver <COMMAND>
+          External OCR solver command (e.g., "python ocr_helper.py"). If not specified, the program will auto-detect "thsr_solver.py" in the current directory
+  -M, --monitor
+          Periodically check for tickets if not found
+      --interval <SECONDS>
+          Interval in seconds between checks in monitor mode (default: 60) [default: 60]
+      --timeout <TIMEOUT>
+          Global timeout in seconds (default: 0, no timeout). Recommended by Nana: 10s for single runs [default: 0]
   -h, --help
           Print help
   -V, --version
           Print version
 ```
 
+## Captcha Solver Integration
+
+The tool can automatically solve captchas using an external OCR script.
+
+### Interface Specification
+The program calls the specified solver command and passes the path to the captcha image as the **last argument**. The solver should output the recognized text directly to `stdout`.
+
+**Default Behavior**: If `--solver` is not specified, it looks for `thsr_solver.py` in the current directory.
+
+### Example Dummy Solver (Python)
+```python
+import sys
+
+def solve(image_path):
+    # Your OCR logic here (e.g., call an API or use a library)
+    # image_path is passed as the last argument
+    print("1234") # Output the recognized code to stdout
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        solve(sys.argv[-1])
+```
 
 ## ***DISCLAIMER***
 
