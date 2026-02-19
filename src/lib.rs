@@ -494,28 +494,9 @@ pub mod booking_flow {
         
                     // Auto-detect solver plugin if not specified
                     if effective_solver.is_none() {
-                        let candidates = [
-                            "thsr_solver.py",
-                            "deprecated_python/thsr_solver.py"
-                        ];
-        
-                        for cand in candidates {
-                            let plugin_path = std::path::Path::new(cand);
-                            if plugin_path.exists() {
-                                let python_exe = if cfg!(target_os = "windows") {
-                                    let venv_py = std::path::Path::new(".venv/Scripts/python.exe");
-                                    if venv_py.exists() {
-                                        venv_py.to_str().unwrap().to_string()
-                                    } else {
-                                        "python".to_string()
-                                    }
-                                } else {
-                                    "python3".to_string()
-                                };
-                                effective_solver = Some(format!("{} {}", python_exe, cand));
-                                println!("Auto-detected solver plugin: {}", effective_solver.as_ref().unwrap());
-                                break;
-                            }
+                        if std::path::Path::new("thsr_solver.py").exists() {
+                            effective_solver = Some("python3 thsr_solver.py".to_string());
+                            println!("Auto-detected solver plugin: {}", effective_solver.as_ref().unwrap());
                         }
                     }
         
