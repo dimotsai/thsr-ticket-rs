@@ -107,6 +107,18 @@ fn main() {
     }
 
     merge_config_into_args(&mut args);
+
+    if args.timeout > 0 {
+        let timeout_secs = args.timeout;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+            eprintln!(
+                "\n[Error] Global timeout of {}s reached. Terminating process.",
+                timeout_secs
+            );
+            std::process::exit(1);
+        });
+    }
     
     if args.monitor {
         let mut retry_count = 0;
