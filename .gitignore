@@ -1,2 +1,18 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.class
+
+# Logs and temporary files
+*.log
 *.jpg
-target/
+*.txt
+
+# IDEs
+.vscode/
+.idea/

@@ -89,7 +89,7 @@ pub struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     pub interval: u64,
 
-    /// Global timeout in seconds (default: 0, no timeout). Recommended by Nana: 10s for single runs
-    #[arg(long, value_name = "TIMEOUT", default_value_t = 0)]
+    /// Global timeout in seconds (default: 30).
+    #[arg(long, value_name = "TIMEOUT", default_value_t = 30)]
     pub timeout: u64,
 }
